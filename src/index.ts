@@ -26,6 +26,72 @@ export const label = ADAPTER_LABEL;
  */
 export const models: { id: string; label: string }[] = [];
 
+const HERMES_FALLBACK_MODEL_IDS = [
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5.3-codex",
+  "gpt-5.2",
+  "gpt-5.2-codex",
+  "gpt-5.1-codex-max",
+  "gpt-5.1-codex-mini",
+  "claude-opus-4.7",
+  "claude-sonnet-4.6",
+  "claude-sonnet-4.5",
+  "claude-haiku-4.5",
+  "gemini-2.5-pro",
+  "grok-4.20-0309-reasoning",
+  "grok-4-1-fast-reasoning",
+  "grok-code-fast-1",
+];
+
+function addModelId(modelsById: Map<string, { id: string; label: string }>, raw: string | undefined) {
+  const id = raw?.trim().replace(/^['"]|['"]$/g, "");
+  if (!id) return;
+  if (!modelsById.has(id)) modelsById.set(id, { id, label: id });
+}
+
+export function parseModelsFromHermesConfig(content: string): { id: string; label: string }[] {
+  const modelsById = new Map<string, { id: string; label: string }>();
+  let inModelsMap = false;
+  let modelsMapIndent = 0;
+
+  for (const line of content.split("\n")) {
+    const uncommented = line.replace(/\s+#.*$/, "");
+    const trimmed = uncommented.trim();
+    if (!trimmed) continue;
+    const indent = line.length - line.trimStart().length;
+
+    if (inModelsMap && indent <= modelsMapIndent) {
+      inModelsMap = false;
+    }
+
+    const scalarMatch = trimmed.match(/^(?:default|model|default_model):\s*(.+)$/);
+    if (scalarMatch) addModelId(modelsById, scalarMatch[1]);
+
+    if (/^models:\s*$/.test(trimmed)) {
+      inModelsMap = true;
+      modelsMapIndent = indent;
+      continue;
+    }
+
+    if (inModelsMap && indent > modelsMapIndent) {
+      const modelKeyMatch = trimmed.match(/^([^:#][^:]*):\s*(?:#.*)?$/);
+      if (modelKeyMatch) addModelId(modelsById, modelKeyMatch[1]);
+    }
+  }
+
+  return [...modelsById.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function mergeModels(...groups: Array<{ id: string; label: string }[]>): { id: string; label: string }[] {
+  const modelsById = new Map<string, { id: string; label: string }>();
+  for (const group of groups) {
+    for (const model of group) addModelId(modelsById, model.id);
+  }
+  return [...modelsById.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
 /**
  * Probe an OpenAI-compatible /v1/models endpoint and return sorted model entries.
  * Returns an empty array on any error so callers can fall back gracefully.
@@ -69,8 +135,10 @@ export async function listModels(): Promise<{ id: string; label: string }[]> {
   try {
     content = await readFile(configPath, "utf-8");
   } catch {
-    return [];
+    return HERMES_FALLBACK_MODEL_IDS.map((id) => ({ id, label: id }));
   }
+
+  const configuredModels = parseModelsFromHermesConfig(content);
 
   // Extract unique (base_url, api_key) pairs via lightweight regex parsing.
   // Covers both the `custom_providers:` list and the `providers:` map.
@@ -98,23 +166,20 @@ export async function listModels(): Promise<{ id: string; label: string }[]> {
     if (url && (!endpoints.has(url) || (!endpoints.get(url) && key))) endpoints.set(url, key);
   }
 
-  if (endpoints.size === 0) return [];
+  const fallbackModels = HERMES_FALLBACK_MODEL_IDS.map((id) => ({ id, label: id }));
+  if (endpoints.size === 0) return mergeModels(configuredModels, fallbackModels);
 
   const fetched = await Promise.all(
     [...endpoints.entries()].map(([url, key]) => fetchOpenAIModels(url, key)),
   );
 
-  const seen = new Set<string>();
-  const results: { id: string; label: string }[] = [];
+  const fetchedModels: { id: string; label: string }[] = [];
   for (const batch of fetched) {
     for (const m of batch) {
-      if (!seen.has(m.id)) {
-        seen.add(m.id);
-        results.push(m);
-      }
+      fetchedModels.push(m);
     }
   }
-  return results.sort((a, b) => a.id.localeCompare(b.id));
+  return mergeModels(configuredModels, fetchedModels, fallbackModels);
 }
 
 /**

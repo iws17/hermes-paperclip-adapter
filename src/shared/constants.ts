@@ -32,13 +32,20 @@ export const VALID_PROVIDERS = [
   "copilot",
   "copilot-acp",
   "anthropic",
+  "gemini",
   "xai",
+  "ollama-cloud",
   "huggingface",
   "zai",
   "kimi-coding",
+  "kimi-coding-cn",
+  "stepfun",
   "minimax",
   "minimax-cn",
   "kilocode",
+  "xiaomi",
+  "arcee",
+  "nvidia",
 ] as const;
 
 /**

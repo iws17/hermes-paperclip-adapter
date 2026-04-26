@@ -66,6 +66,103 @@ function cfgStringArray(v: unknown): string[] | undefined {
     : undefined;
 }
 
+function nonEmptyString(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const trimmed = v.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const resolved = nonEmptyString(value);
+    if (resolved) return resolved;
+  }
+  return undefined;
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function jsonString(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => nonEmptyString(item))
+    .filter((item): item is string => Boolean(item));
+}
+
+interface PaperclipWakeContext {
+  taskId?: string;
+  taskTitle: string;
+  taskBody: string;
+  commentId?: string;
+  wakeReason?: string;
+  companyName: string;
+  projectName: string;
+  workspaceDir?: string;
+  linkedIssueIds: string[];
+  wakePayloadJson?: string;
+}
+
+function resolvePaperclipWakeContext(ctx: AdapterExecutionContext): PaperclipWakeContext {
+  const context = recordValue(ctx.context);
+  const config = recordValue(ctx.config);
+  const issue = recordValue(context.paperclipIssue);
+  const workspace = recordValue(context.paperclipWorkspace);
+
+  const taskId = firstString(
+    context.taskId,
+    context.issueId,
+    issue.id,
+    config.taskId,
+    config.issueId,
+  );
+  const taskTitle = firstString(
+    context.taskTitle,
+    context.issueTitle,
+    issue.title,
+    config.taskTitle,
+    config.issueTitle,
+  ) || "";
+  const taskBody = firstString(
+    context.taskBody,
+    context.issueBody,
+    context.paperclipTaskMarkdown,
+    issue.description,
+    config.taskBody,
+    config.issueBody,
+  ) || "";
+
+  return {
+    taskId,
+    taskTitle,
+    taskBody,
+    commentId: firstString(
+      context.wakeCommentId,
+      context.commentId,
+      config.wakeCommentId,
+      config.commentId,
+    ),
+    wakeReason: firstString(context.wakeReason, config.wakeReason),
+    companyName: firstString(context.companyName, config.companyName) || "",
+    projectName: firstString(context.projectName, config.projectName) || "",
+    workspaceDir: firstString(workspace.cwd, context.workspaceDir, config.workspaceDir),
+    linkedIssueIds: stringArray(context.issueIds),
+    wakePayloadJson: jsonString(context.paperclipWake),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Wake-up prompt builder
 // ---------------------------------------------------------------------------
@@ -126,20 +223,21 @@ Address the comment, POST a reply if needed, then continue working.
 4. If truly nothing to do, report briefly what you checked.
 {{/noTask}}`;
 
-function buildPrompt(
+export function buildPrompt(
   ctx: AdapterExecutionContext,
   config: Record<string, unknown>,
 ): string {
   const template = cfgString(config.promptTemplate) || DEFAULT_PROMPT_TEMPLATE;
 
-  const taskId = cfgString(ctx.config?.taskId);
-  const taskTitle = cfgString(ctx.config?.taskTitle) || "";
-  const taskBody = cfgString(ctx.config?.taskBody) || "";
-  const commentId = cfgString(ctx.config?.commentId) || "";
-  const wakeReason = cfgString(ctx.config?.wakeReason) || "";
+  const wake = resolvePaperclipWakeContext(ctx);
+  const taskId = wake.taskId;
+  const taskTitle = wake.taskTitle;
+  const taskBody = wake.taskBody;
+  const commentId = wake.commentId || "";
+  const wakeReason = wake.wakeReason || "";
   const agentName = ctx.agent?.name || "Hermes Agent";
-  const companyName = cfgString(ctx.config?.companyName) || "";
-  const projectName = cfgString(ctx.config?.projectName) || "";
+  const companyName = wake.companyName;
+  const projectName = wake.projectName;
 
   // Build API URL — ensure it has the /api path
   let paperclipApiUrl =
@@ -452,8 +550,13 @@ export async function execute(
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
   if ((ctx as any).authToken && !env.PAPERCLIP_API_KEY)
     env.PAPERCLIP_API_KEY = (ctx as any).authToken;
-  const taskId = cfgString(ctx.config?.taskId);
-  if (taskId) env.PAPERCLIP_TASK_ID = taskId;
+  const wake = resolvePaperclipWakeContext(ctx);
+  if (wake.taskId) env.PAPERCLIP_TASK_ID = wake.taskId;
+  if (wake.wakeReason) env.PAPERCLIP_WAKE_REASON = wake.wakeReason;
+  if (wake.commentId) env.PAPERCLIP_WAKE_COMMENT_ID = wake.commentId;
+  if (wake.linkedIssueIds.length > 0)
+    env.PAPERCLIP_LINKED_ISSUE_IDS = wake.linkedIssueIds.join(",");
+  if (wake.wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wake.wakePayloadJson;
 
   const userEnv = config.env as Record<string, string> | undefined;
   if (userEnv && typeof userEnv === "object") {
@@ -462,7 +565,7 @@ export async function execute(
 
   // ── Resolve working directory ──────────────────────────────────────────
   const cwd =
-    cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir) || ".";
+    cfgString(config.cwd) || wake.workspaceDir || ".";
   try {
     await ensureAbsoluteDirectory(cwd);
   } catch {
